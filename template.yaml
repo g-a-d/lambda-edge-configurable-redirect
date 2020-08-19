@@ -1,0 +1,106 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: SAM template to implement a general-purpose redirect service using Lambda@Edge
+
+Parameters:
+  DomainName:
+    Type: String
+    Description: Domain name of the Cloudfront distribution
+  RedirectToHost:
+    Type: String
+    Description: Host to redirect to
+  RedirectToPath:
+    Type: String
+    Description: Path to redirect to (no leading /)
+  HostedZoneId:
+    Type: String
+    Description: Hosted zone to create alias record in (that can serve the DomainName parameter)
+
+Resources:
+  SSLCert:
+    Type: "AWS::CertificateManager::Certificate"
+    Properties: 
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+
+  R53EntryBare:
+    Type: "AWS::Route53::RecordSet"
+    Properties: 
+      AliasTarget: 
+        HostedZoneId: Z2FDTNDATAQYW2
+        DNSName: !GetAtt CFDistribution.DomainName
+      Comment: Route to CloudFront distribution redirect
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub ${DomainName}.
+      Type: A
+
+  CFDistribution:
+      Type: AWS::CloudFront::Distribution
+      Properties:
+        DistributionConfig:
+          ViewerCertificate:
+            AcmCertificateArn: !Ref SSLCert
+            SslSupportMethod: sni-only
+          Enabled: 'true'
+          Aliases:
+            - !Ref DomainName
+            
+          Origins:
+            -
+              Id: MyOrigin
+              DomainName: !Ref RedirectToHost
+              CustomOriginConfig:
+                HTTPPort: 80
+                OriginProtocolPolicy: match-viewer
+          DefaultCacheBehavior:
+            TargetOriginId: MyOrigin
+            LambdaFunctionAssociations:
+              - 
+                EventType: origin-request  # this needs to be origin-request because we don't get protocol with viewer-request
+                LambdaFunctionARN: !Ref LambdaEdgeRedirect.Version
+            ForwardedValues:
+              QueryString: 'false'
+              Headers:
+                - Origin
+                - CloudFront-Forwarded-Proto
+              Cookies:
+                Forward: none
+            ViewerProtocolPolicy: allow-all
+
+  LambdaEdgeRedirect:
+      Type: AWS::Serverless::Function
+      Properties:
+        InlineCode: !Sub |
+          def lambda_handler(event, context):
+            print(event)
+            protocol = event['Records'][0]['cf']['request']['origin']['custom']['protocol']
+            return {
+                "status": 302,
+                "headers": { "location": [{"key": "Location", "value": protocol + "://${RedirectToHost}/${RedirectToPath}"}]},
+                "body": "302 redirect"
+            }
+        Role: !GetAtt LambdaEdgeFunctionRole.Arn
+        Runtime: python3.7
+        Handler: index.lambda_handler
+        Timeout: 5
+        AutoPublishAlias: live 
+
+  LambdaEdgeFunctionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+        Path: "/"
+        ManagedPolicyArns:
+            - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            -
+              Sid: "AllowLambdaServiceToAssumeRole"
+              Effect: "Allow"
+              Action: 
+                - "sts:AssumeRole"
+              Principal:
+                Service: 
+                  - "lambda.amazonaws.com"
+                  - "edgelambda.amazonaws.com"
